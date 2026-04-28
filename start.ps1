@@ -145,7 +145,7 @@ function Read-YesNo([string]$Prompt, [bool]$DefaultValue = $true) {
         return $false
     }
 
-    Write-Host "Некорректный ответ. Будет использовано значение по умолчанию."
+    Write-Host (T "bad_yesno")
     return $DefaultValue
 }
 
@@ -154,7 +154,7 @@ function Invoke-Downloader([string[]]$DownloaderArgs) {
     Write-Host ((T "run_cmd") + " python downloader.py " + ($DownloaderArgs -join ' '))
     & python (Join-Path $scriptDir "downloader.py") @DownloaderArgs
     if ($LASTEXITCODE -ne 0) {
-        throw "Команда завершилась с ошибкой."
+        throw (T "cmd_failed")
     }
 }
 
