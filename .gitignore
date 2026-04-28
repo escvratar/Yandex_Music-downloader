@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+token.txt
+library.csv
+library.json
+YandexMusic/
+Яндекс.Музыка/
