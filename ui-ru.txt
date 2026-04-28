@@ -29,3 +29,6 @@ error_prefix=[ОШИБКА]
 press_enter_exit=Нажмите Enter для выхода
 cmd_failed=Команда завершилась с ошибкой.
 bad_yesno=Некорректный ответ. Будет использовано значение по умолчанию.
+python_alias_error=Обнаружен App Execution Alias для Python (WindowsApps). Установите Python с python.org и/или отключите "App execution aliases" для python.exe/python3.exe в настройках Windows.
+cmd_exit_code=Код завершения:
+diag_hint=Диагностика: выполните `python -c "import sys; print(sys.executable); print(sys.version)"` в этом же окне.

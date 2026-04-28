@@ -54,8 +54,16 @@ function Write-Section([string]$Text) {
 
 function Test-Python {
     try {
+        $cmd = Get-Command python -ErrorAction Stop
+        # Частая причина "Python" + падение: алиас из Microsoft Store (WindowsApps)
+        if ($cmd.Source -like "*\\WindowsApps\\python.exe") {
+            throw (T "python_alias_error")
+        }
+
         $null = & python --version
     } catch {
+        # если это не алиас — значит python реально не найден/не запускается
+        if ($_.Exception.Message -eq (T "python_alias_error")) { throw }
         throw (T "python_missing")
     }
 }
@@ -154,6 +162,9 @@ function Invoke-Downloader([string[]]$DownloaderArgs) {
     Write-Host ((T "run_cmd") + " python downloader.py " + ($DownloaderArgs -join ' '))
     & python (Join-Path $scriptDir "downloader.py") @DownloaderArgs
     if ($LASTEXITCODE -ne 0) {
+        Write-Host ""
+        Write-Host ((T "cmd_exit_code") + " " + $LASTEXITCODE) -ForegroundColor DarkGray
+        Write-Host (T "diag_hint") -ForegroundColor DarkGray
         throw (T "cmd_failed")
     }
 }
