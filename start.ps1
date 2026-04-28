@@ -1,6 +1,15 @@
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
+$InputEncoding = [System.Text.UTF8Encoding]::new()
+[Console]::InputEncoding = [System.Text.UTF8Encoding]::new()
 $OutputEncoding = [System.Text.UTF8Encoding]::new()
+
+# Принуждаем Python писать UTF-8 (лечит "иероглифы" в консоли)
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
+
+# Для Windows PowerShell (5.x) иногда помогает явно переключить кодовую страницу консоли
+try { & chcp 65001 | Out-Null } catch { }
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $scriptDir
@@ -223,5 +232,7 @@ try {
 } catch {
     Write-Host ""
     Write-Host "[ОШИБКА] $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host ""
+    [void](Read-Host "Нажмите Enter для выхода")
     exit 1
 }
