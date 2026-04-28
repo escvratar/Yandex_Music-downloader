@@ -22,8 +22,10 @@ import json
 import time
 import argparse
 import logging
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 # Проверяем наличие библиотек
 try:
@@ -39,6 +41,15 @@ try:
     HAS_TQDM = True
 except ImportError:
     HAS_TQDM = False
+
+# Теги/обложки в файл
+try:
+    from mutagen.id3 import ID3, APIC, COMM, ID3NoHeaderError, TCON, TDRC, TIT2, TPE1, TALB, TRCK, TPOS, TPE2
+    from mutagen.mp3 import MP3
+    from mutagen.flac import FLAC, Picture
+    HAS_MUTAGEN = True
+except Exception:
+    HAS_MUTAGEN = False
 
 # Настройка логирования
 logging.basicConfig(
@@ -122,29 +133,219 @@ def save_album_cover(track, track_dir: Path) -> None:
             log.debug(f"Не удалось сохранить обложку для '{track_dir.name}': {e}")
 
 
-def get_track_target_dir(track, output_dir: Path) -> Path:
-    """Возвращает папку трека в структуре Исполнитель/Альбом."""
-    artists = get_artists_str(track)
-    album = get_album_str(track)
-    artist_safe = sanitize_filename(artists.split(",")[0].strip())
-    album_safe = sanitize_filename(album)
-    return output_dir / artist_safe / album_safe
+def save_cover_to_dir(track, track_dir: Path, album_hint: str = "") -> None:
+    """
+    Сохраняет обложку в указанную папку.
+    Если в одной папке несколько альбомов (например, структура только по исполнителю),
+    стараемся делать имя файла уникальным.
+    """
+    base = "cover"
+    if album_hint:
+        base = f"cover - {sanitize_filename(album_hint)[:80]}"
+    cover_path = track_dir / f"{base}.jpg"
+    if cover_path.exists():
+        return
+
+    cover_source = None
+    if track.albums and track.albums[0]:
+        cover_source = track.albums[0]
+    elif getattr(track, "cover_uri", None):
+        cover_source = track
+    if cover_source is None:
+        return
+
+    try:
+        cover_source.download_cover(str(cover_path), size="1000x1000")
+    except Exception:
+        try:
+            cover_source.download_cover(str(cover_path), size="400x400")
+        except Exception as e:
+            log.debug(f"Не удалось сохранить обложку для '{track_dir.name}': {e}")
 
 
-def get_track_base_filename(track) -> str:
-    """Возвращает базовое имя файла трека без расширения."""
-    artists = get_artists_str(track)
-    title = track.title or "Без названия"
-    return f"{sanitize_filename(artists)} - {sanitize_filename(title)}"
+def _download_cover_bytes(track) -> Optional[bytes]:
+    """
+    Возвращает байты обложки (JPG/PNG) максимально доступного размера.
+    Не падает, если обложки нет.
+    """
+    cover_source = None
+    if getattr(track, "albums", None) and track.albums and track.albums[0]:
+        cover_source = track.albums[0]
+    elif getattr(track, "cover_uri", None):
+        cover_source = track
+    if cover_source is None:
+        return None
 
-
-def find_existing_track_file(track_dir: Path, base_filename: str) -> Optional[Path]:
-    """Ищет уже скачанный трек с любым известным расширением."""
-    for ext in ("mp3", "flac", "m4a", "aac", "ogg", "wav"):
-        candidate = track_dir / f"{base_filename}.{ext}"
-        if candidate.exists():
-            return candidate
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "cover.jpg"
+            try:
+                cover_source.download_cover(str(p), size="1000x1000")
+            except Exception:
+                cover_source.download_cover(str(p), size="400x400")
+            if p.exists():
+                return p.read_bytes()
+    except Exception as e:
+        log.debug(f"Не удалось скачать обложку в память: {e}")
     return None
+
+
+def _get_track_numbers(track) -> Tuple[str, str]:
+    """
+    Возвращает (track_number, disc_number) как строки для тегов.
+    """
+    tr = ""
+    disc = ""
+    try:
+        if getattr(track, "albums", None) and track.albums:
+            a = track.albums[0]
+            pos = getattr(a, "track_position", None) or getattr(track, "track_position", None)
+            if pos:
+                num = getattr(pos, "index", None) or getattr(pos, "track", None) or getattr(pos, "number", None)
+                if num:
+                    tr = str(num)
+                d = getattr(pos, "volume", None) or getattr(pos, "disc", None)
+                if d:
+                    disc = str(d)
+    except Exception:
+        pass
+    return tr, disc
+
+
+def _get_lyrics_text(track) -> str:
+    """
+    Пытается получить текст лирики, если доступно.
+    """
+    try:
+        lyr = getattr(track, "get_lyrics", None)
+        if callable(lyr):
+            obj = lyr()
+            if not obj:
+                return ""
+            # yandex-music может вернуть объект с текстом в разных полях
+            for key in ("full_lyrics", "lyrics", "text"):
+                val = getattr(obj, key, None)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def embed_tags(audio_path: Path, track) -> None:
+    """
+    Вшивает максимально доступные теги в MP3/FLAC:
+    title, artist, album, albumartist, year, tracknumber, discnumber, genre, lyrics, cover.
+    """
+    if not HAS_MUTAGEN:
+        log.debug("Mutagen не установлен — теги не будут записаны.")
+        return
+
+    title = (track.title or "").strip()
+    artists = get_artists_str(track).strip()
+    album = get_album_str(track).strip()
+    year = get_year_str(track).strip()
+    track_no, disc_no = _get_track_numbers(track)
+
+    album_artist = ""
+    try:
+        if getattr(track, "albums", None) and track.albums and getattr(track.albums[0], "artists", None):
+            aa = [a.name for a in track.albums[0].artists if getattr(a, "name", None)]
+            album_artist = ", ".join(aa).strip()
+    except Exception:
+        album_artist = ""
+
+    genre = ""
+    try:
+        # у ЯМ жанры могут быть в track.genre или альбоме
+        genre = (getattr(track, "genre", None) or "").strip()
+        if not genre and getattr(track, "albums", None) and track.albums:
+            genre = (getattr(track.albums[0], "genre", None) or "").strip()
+    except Exception:
+        genre = ""
+
+    lyrics = _get_lyrics_text(track)
+    cover_bytes = _download_cover_bytes(track)
+
+    ext = audio_path.suffix.lower().lstrip(".")
+
+    if ext == "mp3":
+        try:
+            try:
+                tags = ID3(str(audio_path))
+            except ID3NoHeaderError:
+                tags = ID3()
+
+            if title:
+                tags.setall("TIT2", [TIT2(encoding=3, text=title)])
+            if artists:
+                tags.setall("TPE1", [TPE1(encoding=3, text=artists)])
+            if album:
+                tags.setall("TALB", [TALB(encoding=3, text=album)])
+            if album_artist:
+                tags.setall("TPE2", [TPE2(encoding=3, text=album_artist)])
+            if year:
+                tags.setall("TDRC", [TDRC(encoding=3, text=year)])
+            if track_no:
+                tags.setall("TRCK", [TRCK(encoding=3, text=track_no)])
+            if disc_no:
+                tags.setall("TPOS", [TPOS(encoding=3, text=disc_no)])
+            if genre:
+                tags.setall("TCON", [TCON(encoding=3, text=genre)])
+            if lyrics:
+                try:
+                    from mutagen.id3 import USLT
+                    tags.setall("USLT", [USLT(encoding=3, lang="rus", desc="", text=lyrics)])
+                except Exception:
+                    pass
+                tags.setall("COMM", [COMM(encoding=3, lang="rus", desc="Lyrics", text=lyrics[:8000])])
+
+            if cover_bytes:
+                tags.delall("APIC")
+                mime = "image/jpeg"
+                if cover_bytes[:8].startswith(b"\x89PNG\r\n\x1a\n"):
+                    mime = "image/png"
+                tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=cover_bytes))
+
+            tags.save(str(audio_path))
+        except Exception as e:
+            log.debug(f"Не удалось записать теги MP3 в '{audio_path.name}': {e}")
+
+    elif ext == "flac":
+        try:
+            f = FLAC(str(audio_path))
+            if title:
+                f["title"] = title
+            if artists:
+                f["artist"] = artists
+            if album:
+                f["album"] = album
+            if album_artist:
+                f["albumartist"] = album_artist
+            if year:
+                f["date"] = year
+            if track_no:
+                f["tracknumber"] = track_no
+            if disc_no:
+                f["discnumber"] = disc_no
+            if genre:
+                f["genre"] = genre
+            if lyrics:
+                f["lyrics"] = lyrics
+
+            if cover_bytes:
+                f.clear_pictures()
+                pic = Picture()
+                pic.type = 3  # front cover
+                pic.desc = "Cover"
+                pic.data = cover_bytes
+                pic.mime = "image/jpeg"
+                if cover_bytes[:8].startswith(b"\x89PNG\r\n\x1a\n"):
+                    pic.mime = "image/png"
+                f.add_picture(pic)
+            f.save()
+        except Exception as e:
+            log.debug(f"Не удалось записать теги FLAC в '{audio_path.name}': {e}")
 
 
 def download_track(
@@ -153,7 +354,9 @@ def download_track(
     fmt: str = "mp3",
     skip_existing: bool = True,
     with_covers: bool = False,
-) -> str:
+    album_folders: bool = False,
+    retries: int = 2,
+) -> bool:
     """
     Скачивает один трек.
     
@@ -164,50 +367,72 @@ def download_track(
         skip_existing: пропускать уже скачанные треки
     
     Returns:
-        "downloaded" если трек скачан успешно,
-        "skipped" если трек уже существует,
-        "failed" при ошибке
+        True если трек скачан успешно
     """
     artists = get_artists_str(track)
     title = track.title or "Без названия"
+    album = get_album_str(track)
 
-    # Создаём подпапку Исполнитель/Альбом
-    track_dir = get_track_target_dir(track, output_dir)
+    # Создаём подпапку Исполнитель[/Альбом]
+    artist_safe = sanitize_filename(artists.split(",")[0].strip())
+    if album_folders:
+        album_safe = sanitize_filename(album)
+        track_dir = output_dir / artist_safe / album_safe
+    else:
+        track_dir = output_dir / artist_safe
     track_dir.mkdir(parents=True, exist_ok=True)
     if with_covers:
-        save_album_cover(track, track_dir)
+        if album_folders:
+            save_album_cover(track, track_dir)
+        else:
+            save_cover_to_dir(track, track_dir, album_hint=album)
 
-    filename = get_track_base_filename(track)
-
-    existing_file = find_existing_track_file(track_dir, filename)
-    if skip_existing and existing_file is not None:
-        log.info(f"⏭️ Пропуск (уже скачан): {existing_file.name}")
-        return "skipped"
+    filename = f"{sanitize_filename(artists)} - {sanitize_filename(title)}"
     
     # Определяем расширение
     ext = "mp3"  # по умолчанию
     
-    # Пробуем получить инфо о скачивании
-    try:
-        download_infos = track.get_download_info()
-    except Exception as e:
-        log.warning(f"Не удалось получить информацию о скачивании для '{title}': {e}")
-        return "failed"
+    retries = max(1, int(retries))
+    last_error: Optional[Exception] = None
 
-    if not download_infos:
-        log.warning(f"Нет доступных для скачивания форматов для '{title}'")
-        return "failed"
+    for attempt in range(1, retries + 1):
+        # Пробуем получить инфо о скачивании (на каждой попытке — заново)
+        try:
+            download_infos = track.get_download_info()
+        except Exception as e:
+            last_error = e
+            log.warning(
+                f"Не удалось получить информацию о скачивании для '{title}' "
+                f"(попытка {attempt}/{retries}): {e}"
+            )
+            if attempt < retries:
+                time.sleep(1.0)
+                continue
+            return False
 
-    # Выбираем лучший доступный формат
-    chosen = None
-    if fmt == "lossless":
-        # Ищем FLAC
-        flac_infos = [d for d in download_infos if d.codec == "flac"]
-        if flac_infos:
-            chosen = max(flac_infos, key=lambda d: d.bitrate_in_kbps or 0)
-            ext = "flac"
+        if not download_infos:
+            log.warning(f"Нет доступных для скачивания форматов для '{title}'")
+            return False
+
+        # Выбираем лучший доступный формат
+        chosen = None
+        if fmt == "lossless":
+            # Ищем FLAC
+            flac_infos = [d for d in download_infos if d.codec == "flac"]
+            if flac_infos:
+                chosen = max(flac_infos, key=lambda d: d.bitrate_in_kbps or 0)
+                ext = "flac"
+            else:
+                # Fallback на MP3
+                mp3_infos = [d for d in download_infos if d.codec == "mp3"]
+                if mp3_infos:
+                    chosen = max(mp3_infos, key=lambda d: d.bitrate_in_kbps or 0)
+                    ext = "mp3"
+                else:
+                    chosen = max(download_infos, key=lambda d: d.bitrate_in_kbps or 0)
+                    ext = chosen.codec or "mp3"
         else:
-            # Fallback на MP3
+            # MP3 или лучший доступный
             mp3_infos = [d for d in download_infos if d.codec == "mp3"]
             if mp3_infos:
                 chosen = max(mp3_infos, key=lambda d: d.bitrate_in_kbps or 0)
@@ -215,32 +440,52 @@ def download_track(
             else:
                 chosen = max(download_infos, key=lambda d: d.bitrate_in_kbps or 0)
                 ext = chosen.codec or "mp3"
-    else:
-        # MP3 или лучший доступный
-        mp3_infos = [d for d in download_infos if d.codec == "mp3"]
-        if mp3_infos:
-            chosen = max(mp3_infos, key=lambda d: d.bitrate_in_kbps or 0)
-            ext = "mp3"
-        else:
-            chosen = max(download_infos, key=lambda d: d.bitrate_in_kbps or 0)
-            ext = chosen.codec or "mp3"
 
-    if not chosen:
-        log.warning(f"Не удалось выбрать формат для '{title}'")
-        return "failed"
+        if not chosen:
+            log.warning(f"Не удалось выбрать формат для '{title}'")
+            return False
 
-    filepath = track_dir / f"{filename}.{ext}"
+        filepath = track_dir / f"{filename}.{ext}"
 
-    try:
-        chosen.download(str(filepath))
-        log.info(f"✅ Скачан: {artists} - {title} [{ext.upper()}, {chosen.bitrate_in_kbps}kbps]")
-        return "downloaded"
-    except Exception as e:
-        log.error(f"❌ Ошибка скачивания '{title}': {e}")
-        # Удаляем неполный файл
-        if filepath.exists():
-            filepath.unlink()
-        return "failed"
+        if skip_existing and filepath.exists():
+            log.debug(f"Пропуск (уже скачан): {filepath.name}")
+            # Если файл уже есть — всё равно попробуем вшить/обновить теги
+            try:
+                embed_tags(filepath, track)
+            except Exception:
+                pass
+            return True
+
+        try:
+            chosen.download(str(filepath))
+            embed_tags(filepath, track)
+            log.info(f"✅ Скачан: {artists} - {title} [{ext.upper()}, {chosen.bitrate_in_kbps}kbps]")
+            return True
+        except Exception as e:
+            last_error = e
+            if attempt < retries:
+                log.warning(
+                    f"Ошибка скачивания '{title}' (попытка {attempt}/{retries}): {e}. "
+                    f"Повтор через 2 сек..."
+                )
+            else:
+                log.error(f"❌ Ошибка скачивания '{title}': {e}")
+
+            # Удаляем неполный файл
+            try:
+                if filepath.exists():
+                    filepath.unlink()
+            except Exception:
+                pass
+
+            if attempt < retries:
+                time.sleep(2.0)
+                continue
+            return False
+
+    if last_error:
+        log.debug(f"Скачивание не удалось после {retries} попыток: {last_error}")
+    return False
 
 
 def export_library(client: Client, output_file: Path, export_format: str = "csv"):
@@ -333,7 +578,9 @@ def export_library(client: Client, output_file: Path, export_format: str = "csv"
 
 def download_library(client: Client, output_dir: Path, fmt: str = "mp3", 
                      skip_existing: bool = True, limit: Optional[int] = None,
-                     with_covers: bool = False):
+                     with_covers: bool = False,
+                     album_folders: bool = False,
+                     concurrency: int = 1):
     """
     Скачивает всю библиотеку пользователя.
     """
@@ -361,49 +608,77 @@ def download_library(client: Client, output_dir: Path, fmt: str = "mp3",
     
     success = 0
     failed = 0
-    skipped = 0
 
-    for i, short_track in enumerate(track_shorts, 1):
-        print(f"\r[{i}/{total}] ", end="", flush=True)
-        
+    # 1) Сначала загрузим полные объекты треков батчами (быстрее и стабильнее, чем в потоках)
+    track_ids = [
+        f"{t.id}:{t.album_id}" if getattr(t, "album_id", None) else str(t.id)
+        for t in track_shorts
+    ]
+    full_tracks = []
+    batch_size = 100
+    for i in range(0, len(track_ids), batch_size):
+        batch = track_ids[i:i + batch_size]
         try:
-            track_id = f"{short_track.id}:{short_track.album_id}" if short_track.album_id else str(short_track.id)
-            tracks = client.tracks([track_id])
-            if not tracks:
-                failed += 1
-                continue
-            
-            track = tracks[0]
-            if not track.available:
-                log.warning(f"Трек недоступен: {track.title}")
-                failed += 1
-                continue
-
-            result = download_track(
-                track,
-                output_dir,
-                fmt=fmt,
-                skip_existing=skip_existing,
-                with_covers=with_covers,
-            )
-            if result == "downloaded":
-                success += 1
-            elif result == "skipped":
-                skipped += 1
-            else:
-                failed += 1
-                
+            tracks = client.tracks(batch)
+            for tr in tracks or []:
+                if tr and getattr(tr, "available", False):
+                    full_tracks.append(tr)
         except Exception as e:
-            log.error(f"Ошибка обработки трека: {e}")
-            failed += 1
-        
-        # Небольшая задержка чтобы не перегружать API
-        time.sleep(0.5)
+            log.warning(f"Ошибка при загрузке батча треков: {e}")
+        time.sleep(0.2)
+
+    if not full_tracks:
+        log.warning("Не удалось получить доступные треки для скачивания.")
+        return
+
+    # 2) Скачивание: параллельно, если concurrency > 1
+    concurrency = max(1, int(concurrency))
+    planned_total = len(full_tracks)
+    log.info(f"🚀 Старт скачивания: {planned_total} треков, одновременно: {concurrency}")
+
+    def _worker(tr):
+        return download_track(
+            tr,
+            output_dir,
+            fmt=fmt,
+            skip_existing=skip_existing,
+            with_covers=with_covers,
+            album_folders=album_folders,
+            retries=2,
+        )
+
+    done = 0
+    if concurrency == 1:
+        for tr in full_tracks:
+            done += 1
+            print(f"\r[{done}/{planned_total}] ", end="", flush=True)
+            try:
+                if _worker(tr):
+                    success += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                log.error(f"Ошибка обработки трека: {e}")
+                failed += 1
+            time.sleep(0.2)
+    else:
+        with ThreadPoolExecutor(max_workers=concurrency) as ex:
+            futures = [ex.submit(_worker, tr) for tr in full_tracks]
+            for fut in as_completed(futures):
+                done += 1
+                print(f"\r[{done}/{planned_total}] ", end="", flush=True)
+                try:
+                    if fut.result():
+                        success += 1
+                    else:
+                        failed += 1
+                except Exception as e:
+                    log.error(f"Ошибка обработки трека: {e}")
+                    failed += 1
 
     print()  # перевод строки после \r
     log.info(f"\n{'='*50}")
     log.info(f"✅ Успешно скачано: {success}")
-    log.info(f"⏭️ Пропущено:      {skipped}")
     log.info(f"❌ Ошибок:         {failed}")
     log.info(f"📁 Папка:          {output_dir}")
     log.info(f"{'='*50}")
@@ -524,6 +799,10 @@ def main():
                         help="Не пропускать уже скачанные файлы (перезаписывать)")
     parser.add_argument("--with-covers", action="store_true",
                         help="Сохранять обложки альбомов в папках с музыкой")
+    parser.add_argument("--album-folders", action="store_true",
+                        help="Создавать подпапки альбомов: Исполнитель/Альбом (по умолчанию: только Исполнитель)")
+    parser.add_argument("--concurrency", type=int, default=1,
+                        help="Сколько треков скачивать одновременно (по умолчанию: 1)")
     parser.add_argument("--limit", type=int, default=None,
                         help="Ограничить количество треков (для тестирования)")
     parser.add_argument("--verbose", action="store_true", help="Подробный вывод")
@@ -613,6 +892,8 @@ def main():
             skip_existing=not args.no_skip,
             limit=args.limit,
             with_covers=args.with_covers,
+            album_folders=args.album_folders,
+            concurrency=args.concurrency,
         )
 
 

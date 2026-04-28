@@ -23,7 +23,7 @@ function Test-Python {
 function Ensure-Dependencies {
     Write-Host "Проверка зависимостей..."
     try {
-        $null = & python -c "import yandex_music, tqdm"
+        $null = & python -c "import yandex_music, tqdm, mutagen"
         Write-Host "[OK] Зависимости уже установлены."
     } catch {
         Write-Host "Установка зависимостей из requirements.txt..."
@@ -75,6 +75,18 @@ function Read-OptionalLimit {
     }
     Write-Host "Некорректное значение. Ограничение применяться не будет."
     return $null
+}
+
+function Read-OptionalConcurrency {
+    $raw = Read-Host "Сколько треков скачивать одновременно? [1]"
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        return 1
+    }
+    if ($raw -match '^\d+$' -and [int]$raw -gt 0) {
+        return [int]$raw
+    }
+    Write-Host "Некорректное значение. Используется 1."
+    return 1
 }
 
 function Read-YesNo([string]$Prompt, [bool]$DefaultValue = $true) {
@@ -137,10 +149,14 @@ try {
             4 {
                 $output = Read-OptionalValue "Папка для сохранения музыки" (Join-Path $scriptDir "YandexMusic")
                 $limit = Read-OptionalLimit
+                $concurrency = Read-OptionalConcurrency
                 $withCovers = Read-YesNo "Скачивать обложки?" $true
                 $args = $commonArgs + @("--download", "--quality", "mp3", "--output", $output)
                 if ($null -ne $limit) {
                     $args += @("--limit", "$limit")
+                }
+                if ($concurrency -gt 1) {
+                    $args += @("--concurrency", "$concurrency")
                 }
                 if ($withCovers) {
                     $args += "--with-covers"
@@ -150,10 +166,14 @@ try {
             5 {
                 $output = Read-OptionalValue "Папка для сохранения музыки" (Join-Path $scriptDir "YandexMusic")
                 $limit = Read-OptionalLimit
+                $concurrency = Read-OptionalConcurrency
                 $withCovers = Read-YesNo "Скачивать обложки?" $true
                 $args = $commonArgs + @("--download", "--quality", "lossless", "--output", $output)
                 if ($null -ne $limit) {
                     $args += @("--limit", "$limit")
+                }
+                if ($concurrency -gt 1) {
+                    $args += @("--concurrency", "$concurrency")
                 }
                 if ($withCovers) {
                     $args += "--with-covers"
@@ -163,11 +183,15 @@ try {
             6 {
                 $output = Read-OptionalValue "Папка для сохранения музыки" (Join-Path $scriptDir "YandexMusic")
                 $limit = Read-OptionalLimit
+                $concurrency = Read-OptionalConcurrency
                 $withCovers = Read-YesNo "Скачивать обложки?" $true
                 Invoke-Downloader ($commonArgs + @("--list", "--export-format", "csv"))
                 $args = $commonArgs + @("--download", "--quality", "mp3", "--output", $output)
                 if ($null -ne $limit) {
                     $args += @("--limit", "$limit")
+                }
+                if ($concurrency -gt 1) {
+                    $args += @("--concurrency", "$concurrency")
                 }
                 if ($withCovers) {
                     $args += "--with-covers"
@@ -177,11 +201,15 @@ try {
             7 {
                 $output = Read-OptionalValue "Папка для сохранения музыки" (Join-Path $scriptDir "YandexMusic")
                 $limit = Read-OptionalLimit
+                $concurrency = Read-OptionalConcurrency
                 $withCovers = Read-YesNo "Скачивать обложки?" $true
                 Invoke-Downloader ($commonArgs + @("--list", "--export-format", "json"))
                 $args = $commonArgs + @("--download", "--quality", "lossless", "--output", $output)
                 if ($null -ne $limit) {
                     $args += @("--limit", "$limit")
+                }
+                if ($concurrency -gt 1) {
+                    $args += @("--concurrency", "$concurrency")
                 }
                 if ($withCovers) {
                     $args += "--with-covers"
